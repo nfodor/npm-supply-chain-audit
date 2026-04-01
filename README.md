@@ -48,6 +48,28 @@ node index.js --package axios 1.14.0 --repo axios/axios
 node index.js --all-deps
 ```
 
+## Investigation Safety
+
+If you are investigating a suspected npm compromise, do not start with:
+
+```bash
+rm -rf node_modules && npm install
+```
+
+That will run lifecycle scripts unless you pass `--ignore-scripts`, which can execute attacker-controlled code and alter the evidence you are trying to inspect.
+
+Safer options:
+
+```bash
+# Recreate the lockfile-pinned tree without running install scripts
+npm ci --ignore-scripts
+
+# If you do not have a trustworthy lockfile, disable scripts explicitly
+npm install --ignore-scripts
+```
+
+For high-confidence investigation, inspect the exact published tarball directly instead of trusting a post-install `node_modules` tree.
+
 ## Example output
 
 ```
