@@ -231,8 +231,11 @@ function comparePublishedToGit(name, version, npmDeps, npmScripts, gitPkg) {
         report('CRITICAL', `${name}@${version}`,
           `KNOWN MALICIOUS dependency "${dep}" in npm but NOT in trusted source`);
       } else if (isSuspicious) {
-        report('WARNING', `${name}@${version}`,
+        report('CRITICAL', `${name}@${version}`,
           `Suspicious dependency "${dep}" in npm but NOT in trusted source`);
+      } else {
+        report('WARNING', `${name}@${version}`,
+          `Dependency "${dep}" in npm but NOT in trusted source — possible injection`);
       }
     }
   }
