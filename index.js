@@ -50,18 +50,20 @@ const SUSPICIOUS_DEP_PATTERNS = [
   /^node-/,         // common typosquat prefix
 ];
 
+const INSTALL_SCRIPT_NAMES = ['postinstall', 'preinstall', 'install'];
+
 let findings = [];
 let scanned = 0;
 
 // ===== HTTP helpers =====
 
-function fetchJSON(url) {
+function fetchJSON(url, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('timeout')), 15000);
-    https.get(url, { headers: { 'User-Agent': 'npm-supply-chain-audit/1.0' } }, (res) => {
+    https.get(url, { headers: { 'User-Agent': 'npm-supply-chain-audit/1.0', ...extraHeaders } }, (res) => {
       if (res.statusCode === 301 || res.statusCode === 302) {
         clearTimeout(timer);
-        return fetchJSON(res.headers.location).then(resolve).catch(reject);
+        return fetchJSON(res.headers.location, extraHeaders).then(resolve).catch(reject);
       }
       let body = '';
       res.on('data', c => body += c);
@@ -74,13 +76,13 @@ function fetchJSON(url) {
   });
 }
 
-function fetchText(url) {
+function fetchText(url, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('timeout')), 15000);
-    https.get(url, { headers: { 'User-Agent': 'npm-supply-chain-audit/1.0' } }, (res) => {
+    https.get(url, { headers: { 'User-Agent': 'npm-supply-chain-audit/1.0', ...extraHeaders } }, (res) => {
       if (res.statusCode === 301 || res.statusCode === 302) {
         clearTimeout(timer);
-        return fetchText(res.headers.location).then(resolve).catch(reject);
+        return fetchText(res.headers.location, extraHeaders).then(resolve).catch(reject);
       }
       let body = '';
       res.on('data', c => body += c);
@@ -97,9 +99,160 @@ function report(severity, pkg, message) {
   console.log(`  [${icon}] ${pkg}: ${message}`);
 }
 
+function parseGitHubRepoSpec(input) {
+  if (!input || typeof input !== 'string') return null;
+
+  let value = input.trim();
+  if (!value) return null;
+
+  if (value.startsWith('git+')) value = value.slice(4);
+  value = value.replace(/^git@github\.com:/i, 'https://github.com/');
+
+  const shortMatch = value.match(/^([^/\s]+)\/([^/\s]+)$/);
+  if (shortMatch) {
+    return {
+      owner: shortMatch[1],
+      repo: shortMatch[2].replace(/\.git$/i, ''),
+    };
+  }
+
+  const urlMatch = value.match(/^https?:\/\/github\.com\/([^/]+)\/([^/#?]+?)(?:\.git)?(?:[#/?].*)?$/i);
+  if (!urlMatch) return null;
+
+  return {
+    owner: urlMatch[1],
+    repo: urlMatch[2],
+  };
+}
+
+function buildMonorepoSubdirs(name) {
+  if (!name.startsWith('@')) return [];
+
+  const parts = name.split('/');
+  const shortName = parts[1];
+  const scope = parts[0].slice(1);
+
+  return [...new Set([
+    `packages/${shortName}`,
+    `clients/${shortName}`,
+    `libs/${shortName}`,
+    `modules/${shortName}`,
+    `packages/${scope}-${shortName}`,
+  ])];
+}
+
+function buildVersionRefCandidates(name, version) {
+  const shortName = name.startsWith('@') ? name.split('/')[1] : name;
+
+  return [...new Set([
+    `v${version}`,
+    version,
+    `${name}@${version}`,
+    `${shortName}@${version}`,
+    `${name}/v${version}`,
+    `${shortName}/v${version}`,
+  ])];
+}
+
+async function fetchGitHubRefNames(owner, repo, fetchJSONImpl = fetchJSON) {
+  const headers = { Accept: 'application/vnd.github+json' };
+  const refs = new Set();
+
+  try {
+    const tags = await fetchJSONImpl(`https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`, headers);
+    if (Array.isArray(tags)) {
+      for (const tag of tags) {
+        if (tag && typeof tag.name === 'string') refs.add(tag.name);
+      }
+    }
+  } catch {
+    // Fall back to exact candidate guesses if the GitHub API is unavailable.
+  }
+
+  try {
+    const releases = await fetchJSONImpl(`https://api.github.com/repos/${owner}/${repo}/releases?per_page=100`, headers);
+    if (Array.isArray(releases)) {
+      for (const release of releases) {
+        if (release && typeof release.tag_name === 'string') refs.add(release.tag_name);
+      }
+    }
+  } catch {
+    // Some repos do not publish releases.
+  }
+
+  return refs;
+}
+
+async function resolveTrustedGitPackage(name, version, repoSpec, options = {}) {
+  const fetchJSONImpl = options.fetchJSONImpl || fetchJSON;
+  const fetchTextImpl = options.fetchTextImpl || fetchText;
+  const knownRefs = await fetchGitHubRefNames(repoSpec.owner, repoSpec.repo, fetchJSONImpl);
+  const exactCandidates = buildVersionRefCandidates(name, version);
+  const refsToTry = exactCandidates.filter(ref => knownRefs.size === 0 || knownRefs.has(ref));
+  const searchRefs = refsToTry.length > 0 ? refsToTry : exactCandidates;
+  const packagePaths = [...buildMonorepoSubdirs(name), ''];
+
+  for (const ref of searchRefs) {
+    for (const packageDir of packagePaths) {
+      const packagePath = packageDir ? `${packageDir}/package.json` : 'package.json';
+
+      try {
+        const resp = await fetchTextImpl(
+          `https://raw.githubusercontent.com/${repoSpec.owner}/${repoSpec.repo}/${ref}/${packagePath}`
+        );
+        if (resp.status !== 200) continue;
+
+        const parsed = JSON.parse(resp.body);
+        if (parsed.name !== name || parsed.version !== version) continue;
+
+        return {
+          ref,
+          packagePath,
+          gitPkg: parsed,
+        };
+      } catch {
+        // Try the next exact ref/path candidate.
+      }
+    }
+  }
+
+  return null;
+}
+
+function comparePublishedToGit(name, version, npmDeps, npmScripts, gitPkg) {
+  const gitDeps = { ...gitPkg.dependencies };
+
+  // deps in npm but NOT in git = possible injection
+  for (const dep of Object.keys(npmDeps)) {
+    if (!gitDeps[dep]) {
+      const isMalicious = KNOWN_MALICIOUS.has(dep);
+      const isSuspicious = SUSPICIOUS_DEP_PATTERNS.some(pattern => pattern.test(dep));
+      if (isMalicious) {
+        report('CRITICAL', `${name}@${version}`,
+          `KNOWN MALICIOUS dependency "${dep}" in npm but NOT in trusted source`);
+      } else if (isSuspicious) {
+        report('WARNING', `${name}@${version}`,
+          `Suspicious dependency "${dep}" in npm but NOT in trusted source`);
+      }
+    }
+  }
+
+  const gitScripts = gitPkg.scripts || {};
+  for (const scriptName of INSTALL_SCRIPT_NAMES) {
+    if (npmScripts[scriptName] && !gitScripts[scriptName]) {
+      report('CRITICAL', `${name}@${version}`,
+        `Script "${scriptName}" exists in npm but NOT in trusted source — possible injection`);
+    } else if (npmScripts[scriptName] && gitScripts[scriptName] &&
+               npmScripts[scriptName] !== gitScripts[scriptName]) {
+      report('WARNING', `${name}@${version}`,
+        `Script "${scriptName}" differs between npm and trusted source`);
+    }
+  }
+}
+
 // ===== Core audit =====
 
-async function auditPackage(name, installedVersion) {
+async function auditPackage(name, installedVersion, options = {}) {
   scanned++;
   process.stdout.write(`  Scanning ${name}@${installedVersion || 'latest'}...`);
 
@@ -132,7 +285,7 @@ async function auditPackage(name, installedVersion) {
 
     // 3. Check for suspicious postinstall scripts
     for (const [scriptName, scriptCmd] of Object.entries(npmScripts)) {
-      if (scriptName === 'postinstall' || scriptName === 'preinstall' || scriptName === 'install') {
+      if (INSTALL_SCRIPT_NAMES.includes(scriptName)) {
         for (const pattern of SUSPICIOUS_SCRIPTS) {
           if (pattern.test(scriptCmd)) {
             report('WARNING', `${name}@${version}`, `Suspicious ${scriptName} script: ${scriptCmd.slice(0, 100)}`);
@@ -141,105 +294,7 @@ async function auditPackage(name, installedVersion) {
       }
     }
 
-    // 4. Find GitHub repo and compare
-    const repoUrl = npmData.repository?.url || versionData.repository?.url || '';
-    const ghMatch = repoUrl.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-
-    if (!ghMatch) {
-      report('INFO', `${name}@${version}`, 'No GitHub repo linked — cannot compare source vs published');
-      return;
-    }
-
-    const [, owner, repo] = ghMatch;
-
-    // For monorepo packages, derive subdirectory from package name
-    // e.g., @aws-sdk/client-s3 → clients/client-s3, @sentry/node → packages/node
-    const monorepoSubdirs = [];
-    if (name.startsWith('@')) {
-      const parts = name.split('/');
-      const shortName = parts[1];
-      monorepoSubdirs.push(
-        `packages/${shortName}`,
-        `clients/${shortName}`,
-        `libs/${shortName}`,
-        `modules/${shortName}`,
-        `packages/${parts[0].slice(1)}-${shortName}`
-      );
-    }
-
-    // Try to fetch package.json from git: tag → monorepo subdir → root → branch
-    let gitPkg = null;
-    const tagVariants = [`v${version}`, version, `${name}@${version}`];
-    const branches = ['main', 'master'];
-
-    for (const ref of [...tagVariants, ...branches]) {
-      // Try monorepo subdirs first
-      for (const subdir of monorepoSubdirs) {
-        try {
-          const resp = await fetchText(
-            `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/${subdir}/package.json`
-          );
-          if (resp.status === 200) {
-            const parsed = JSON.parse(resp.body);
-            if (parsed.name === name) { gitPkg = parsed; break; }
-          }
-        } catch { /* try next */ }
-      }
-      if (gitPkg) break;
-
-      // Try root package.json
-      try {
-        const resp = await fetchText(
-          `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/package.json`
-        );
-        if (resp.status === 200) {
-          const parsed = JSON.parse(resp.body);
-          if (parsed.name === name) { gitPkg = parsed; break; }
-          // Root doesn't match package name — likely monorepo, skip root
-          if (monorepoSubdirs.length === 0) { gitPkg = parsed; break; }
-        }
-      } catch { /* try next */ }
-    }
-
-    if (!gitPkg) {
-      report('INFO', `${name}@${version}`, `Could not fetch package.json from GitHub (${owner}/${repo})`);
-      return;
-    }
-
-    const gitDeps = { ...gitPkg.dependencies };
-
-    // 5. Compare: deps in npm but NOT in git = possible injection
-    for (const dep of Object.keys(npmDeps)) {
-      if (!gitDeps[dep]) {
-        // CRITICAL if known malicious or suspicious pattern, WARNING otherwise (monorepo build artifacts)
-        const isMalicious = KNOWN_MALICIOUS.has(dep);
-        const isSuspicious = SUSPICIOUS_DEP_PATTERNS.some(p => p.test(dep));
-        if (isMalicious) {
-          report('CRITICAL', `${name}@${version}`,
-            `KNOWN MALICIOUS dependency "${dep}" in npm but NOT in GitHub`);
-        } else if (isSuspicious) {
-          report('WARNING', `${name}@${version}`,
-            `Suspicious dependency "${dep}" in npm but NOT in GitHub source`);
-        }
-        // Skip noise for same-org deps (monorepo build output) e.g. @aws-sdk/* in @aws-sdk/client-s3
-        // These are expected — monorepo packages reference siblings that aren't in the subdir package.json
-      }
-    }
-
-    // 6. Compare: scripts in npm but NOT in git
-    const gitScripts = gitPkg.scripts || {};
-    for (const scriptName of ['postinstall', 'preinstall', 'install']) {
-      if (npmScripts[scriptName] && !gitScripts[scriptName]) {
-        report('CRITICAL', `${name}@${version}`,
-          `Script "${scriptName}" exists in npm but NOT in GitHub — possible injection`);
-      } else if (npmScripts[scriptName] && gitScripts[scriptName] &&
-                 npmScripts[scriptName] !== gitScripts[scriptName]) {
-        report('WARNING', `${name}@${version}`,
-          `Script "${scriptName}" differs between npm and GitHub`);
-      }
-    }
-
-    // 7. Check maintainer changes (npm metadata)
+    // 4. Check maintainer changes (npm metadata)
     const maintainers = npmData.maintainers || [];
     for (const m of maintainers) {
       if (m.email && m.email.endsWith('@proton.me')) {
@@ -247,6 +302,24 @@ async function auditPackage(name, installedVersion) {
           `Maintainer ${m.name} uses Proton Mail (${m.email}) — verify this is legitimate`);
       }
     }
+
+    // 5. Compare against a trusted repo only when the caller supplies one.
+    if (!options.trustedRepo) {
+      if (options.reportUntrustedRepo !== false) {
+        report('INFO', `${name}@${version}`,
+          'Skipping source comparison without --repo owner/repo; npm repository metadata is attacker-controlled');
+      }
+      return;
+    }
+
+    const source = await resolveTrustedGitPackage(name, version, options.trustedRepo, options);
+    if (!source) {
+      report('INFO', `${name}@${version}`,
+        `Could not find ${name}@${version} in trusted repo ${options.trustedRepo.owner}/${options.trustedRepo.repo} via an exact tag or release`);
+      return;
+    }
+
+    comparePublishedToGit(name, version, npmDeps, npmScripts, source.gitPkg);
 
   } catch (e) {
     console.log(` error: ${e.message}`);
@@ -307,35 +380,104 @@ async function scanProject(projectDir) {
 
 // ===== CLI =====
 
-(async () => {
-  const args = process.argv.slice(2);
-  const packageFlag = args.indexOf('--package');
-  const allDepsFlag = args.includes('--all-deps');
-  const lockfileFlag = args.indexOf('--lockfile');
+function parseArgs(argv) {
+  const options = {
+    packageName: null,
+    packageVersion: null,
+    allDeps: false,
+    lockfile: null,
+    repo: null,
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+
+    if (arg === '--package') {
+      if (!argv[i + 1] || argv[i + 1].startsWith('--')) {
+        throw new Error('--package requires a package name');
+      }
+      options.packageName = argv[++i] || null;
+      if (argv[i + 1] && !argv[i + 1].startsWith('--')) {
+        options.packageVersion = argv[++i];
+      }
+      continue;
+    }
+
+    if (arg === '--all-deps') {
+      options.allDeps = true;
+      continue;
+    }
+
+    if (arg === '--lockfile') {
+      if (!argv[i + 1] || argv[i + 1].startsWith('--')) {
+        throw new Error('--lockfile requires a path');
+      }
+      options.lockfile = argv[++i] || null;
+      continue;
+    }
+
+    if (arg === '--repo') {
+      if (!argv[i + 1] || argv[i + 1].startsWith('--')) {
+        throw new Error('--repo requires owner/repo or a GitHub URL');
+      }
+      options.repo = argv[++i] || null;
+      continue;
+    }
+
+    if (arg.startsWith('--')) {
+      throw new Error(`Unknown flag: ${arg}`);
+    }
+
+    throw new Error(`Unexpected argument: ${arg}`);
+  }
+
+  return options;
+}
+
+async function main(argv = process.argv.slice(2)) {
+  findings = [];
+  scanned = 0;
+
+  const args = parseArgs(argv);
+  const trustedRepo = args.repo ? parseGitHubRepoSpec(args.repo) : null;
 
   console.log('npm Supply Chain Audit');
   console.log('='.repeat(50));
 
-  if (packageFlag !== -1 && args[packageFlag + 1]) {
+  if (args.repo && !trustedRepo) {
+    console.error('\n--repo must be "owner/repo" or a GitHub URL');
+    return 1;
+  }
+
+  if (args.repo && !args.packageName) {
+    console.error('\n--repo currently requires --package');
+    return 1;
+  }
+
+  if (args.packageName) {
     // Single package mode
-    const name = args[packageFlag + 1];
-    const version = args[packageFlag + 2] && !args[packageFlag + 2].startsWith('--') ? args[packageFlag + 2] : null;
+    const name = args.packageName;
+    const version = args.packageVersion;
     console.log(`\nScanning: ${name}${version ? '@' + version : ''}\n`);
-    await auditPackage(name, version);
+    if (!trustedRepo) {
+      console.log('Note: source comparison is disabled unless you pass --repo owner/repo.\n');
+    }
+    await auditPackage(name, version, { trustedRepo });
 
   } else {
     // Project mode
-    const projectDir = lockfileFlag !== -1 ? path.dirname(args[lockfileFlag + 1]) : process.cwd();
+    const projectDir = args.lockfile ? path.dirname(args.lockfile) : process.cwd();
     console.log(`\nProject: ${projectDir}`);
+    console.log('Note: project scans run metadata-only checks. Use --package <name> --repo <owner/repo> for exact source comparison.\n');
 
     const { allDeps, resolved } = await scanProject(projectDir);
-    const depsToScan = allDepsFlag ? Object.keys(resolved).length > 0 ? resolved : allDeps : allDeps;
+    const depsToScan = args.allDeps ? Object.keys(resolved).length > 0 ? resolved : allDeps : allDeps;
 
-    console.log(`Dependencies: ${Object.keys(depsToScan).length} (${allDepsFlag ? 'all including transitive' : 'direct only'})\n`);
+    console.log(`Dependencies: ${Object.keys(depsToScan).length} (${args.allDeps ? 'all including transitive' : 'direct only'})\n`);
 
     for (const [name] of Object.entries(depsToScan)) {
       const version = resolved[name] || null;
-      await auditPackage(name, version);
+      await auditPackage(name, version, { reportUntrustedRepo: false });
     }
   }
 
@@ -363,5 +505,22 @@ async function scanProject(projectDir) {
     console.log('\n\x1b[32mNo supply chain issues detected.\x1b[0m');
   }
 
-  process.exit(critical.length > 0 ? 1 : 0);
-})();
+  return critical.length > 0 ? 1 : 0;
+}
+
+if (require.main === module) {
+  main().then((code) => {
+    process.exit(code);
+  }).catch((err) => {
+    console.error(err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  buildMonorepoSubdirs,
+  buildVersionRefCandidates,
+  parseArgs,
+  parseGitHubRepoSpec,
+  resolveTrustedGitPackage,
+};
