@@ -1,11 +1,11 @@
 # npm Supply Chain Audit
 
-Detects supply chain attacks on npm packages by comparing what's published to npm against the GitHub source. Built in response to the [axios compromise of March 31, 2026](https://www.stepsecurity.io/blog/axios-compromised-on-npm-malicious-versions-drop-remote-access-trojan).
+Detects supply chain attacks on npm packages by comparing what is published to npm against a trusted, versioned GitHub source snapshot. Built in response to the [axios compromise of March 31, 2026](https://www.stepsecurity.io/blog/axios-compromised-on-npm-malicious-versions-drop-remote-access-trojan).
 
 ## What it detects
 
-- **Dependency injection** — dependencies in the npm tarball that don't exist in the GitHub source (the exact axios attack vector)
-- **Script injection** — postinstall/preinstall scripts in npm that don't exist in git
+- **Dependency injection** — dependencies in the npm tarball that don't exist in a trusted source tag or release (the exact axios attack vector)
+- **Script injection** — postinstall/preinstall scripts in npm that don't exist in a trusted source tag or release
 - **Known malicious packages** — plain-crypto-js, @shadanai/openclaw, @qqbrowser/openclaw-qbot
 - **Account takeover indicators** — maintainer emails changed to suspicious providers
 - **Suspicious dependency names** — typosquat patterns (plain-*, node-* prefix)
@@ -39,6 +39,7 @@ node /path/to/npm-supply-chain-audit/index.js
 ```bash
 node index.js --package axios
 node index.js --package axios 1.14.0
+node index.js --package axios 1.14.0 --repo axios/axios
 ```
 
 ### Scan all dependencies (including transitive)
@@ -79,17 +80,17 @@ For each dependency:
 1. Fetches the package metadata from `registry.npmjs.org`
 2. Checks for known malicious dependencies in the dep tree
 3. Checks for suspicious postinstall scripts
-4. Finds the GitHub repo from npm metadata
-5. Fetches `package.json` from the corresponding git tag (handles monorepos by checking subdirectories)
-6. Diffs dependencies: anything in npm but not in git is flagged
-7. Diffs scripts: postinstall/preinstall in npm but not in git is flagged
+4. Uses a trusted `--repo owner/repo` override for source comparison
+5. Resolves an exact version tag or release and fetches the matching `package.json` (handles common monorepo subdirectories)
+6. Verifies both `name` and `version` before diffing dependencies
+7. Diffs scripts: postinstall/preinstall in npm but not in the exact source snapshot is flagged
 8. Checks maintainer emails for suspicious providers
 
 ## Why this works
 
 The axios attack worked because the attacker had npm publish access (hijacked maintainer account) and added `plain-crypto-js` as a dependency in the npm-published `package.json` — but never committed it to GitHub.
 
-npm publishes whatever tarball you upload. It doesn't verify against the git repo. This tool does that verification.
+npm publishes whatever tarball you upload. It does not verify against git. This tool only performs the source comparison when you provide a trusted repo override, and it only compares against an exact versioned ref.
 
 ## CI integration
 
@@ -103,6 +104,7 @@ npm publishes whatever tarball you upload. It doesn't verify against the git rep
 ## Limitations
 
 - Requires network access to npmjs.org and github.com
+- Exact source comparison requires `--repo owner/repo`; project scans run metadata-only checks unless trusted repo mapping is added in the future
 - Monorepo packages may not be found if the subdirectory structure is non-standard
 - Cannot detect attacks where the GitHub repo itself is compromised
 - Rate limited by GitHub's anonymous API (60 req/hour) — use a token for large scans
